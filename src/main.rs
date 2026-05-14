@@ -1,6 +1,4 @@
-use clap::Parser;
-use regex::Regex;
-use serde::Deserialize;
+use serde_json::Value;
 use std::collections::hash_map::DefaultHasher;
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
@@ -8,62 +6,78 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
-//  CLI
+//  CLI (manual parsing — zero dependencies)
 // ---------------------------------------------------------------------------
-#[derive(Parser, Debug)]
-#[command(name = "detree3", version, about)]
-struct Cli {
-    #[arg(help = "Input file (text list or JSON)")]
+struct Args {
     input_file: PathBuf,
-
-    #[arg(help = "Output directory")]
     output_dir: PathBuf,
-
-    #[arg(long, value_enum, default_value = "auto")]
     format: Format,
-
-    #[arg(long)]
     remove_digits: bool,
-
-    #[arg(long)]
     allow_empty_folders: bool,
 }
 
-#[derive(Clone, Debug, Default, clap::ValueEnum)]
+#[derive(Clone, Debug)]
 enum Format {
-    #[default]
     Auto,
     Text,
     Json,
 }
 
-// ---------------------------------------------------------------------------
-//  Regexes (compiled once, lazy_static not needed: Regex::new is cheap enough
-//  and we only create them once at startup)
-// ---------------------------------------------------------------------------
-struct Cleaners {
-    bad_chars: Regex,
-    lead_list: Regex,
-    whitespace: Regex,
-    dots: Regex,
-    lead_digits: Regex,
-}
+fn parse_args() -> Option<Args> {
+    let mut args = std::env::args().skip(1).peekable();
+    let mut input_file = None;
+    let mut output_dir = None;
+    let mut format = Format::Auto;
+    let mut remove_digits = false;
+    let mut allow_empty_folders = false;
 
-impl Cleaners {
-    fn new() -> Self {
-        Self {
-            bad_chars: Regex::new(r#"[<>:"/\\|?*!%@#$~`^\[\]{}]"#).unwrap(),
-            lead_list: Regex::new(r"^[.\-]+\s*").unwrap(),
-            whitespace: Regex::new(r"\s+").unwrap(),
-            dots: Regex::new(r"\.+").unwrap(),
-            lead_digits: Regex::new(r"^[\d\s]+").unwrap(),
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--format" => {
+                format = match args.next()?.as_str() {
+                    "auto" => Format::Auto,
+                    "text" => Format::Text,
+                    "json" => Format::Json,
+                    _ => return None,
+                };
+            }
+            "--remove-digits" => remove_digits = true,
+            "--allow-empty-folders" => allow_empty_folders = true,
+            "--help" | "-h" => {
+                println!("detree3 <input_file> <output_dir> [OPTIONS]");
+                println!("Options:");
+                println!("  --format <auto|text|json>   Input format (default: auto)");
+                println!("  --remove-digits             Remove leading digits from names");
+                println!("  --allow-empty-folders       Create folders for leaf nodes");
+                std::process::exit(0);
+            }
+            _ if arg.starts_with('-') => {
+                eprintln!("Unknown flag: {}", arg);
+                return None;
+            }
+            _ if input_file.is_none() => input_file = Some(PathBuf::from(arg)),
+            _ if output_dir.is_none() => output_dir = Some(PathBuf::from(arg)),
+            _ => {
+                eprintln!("Unexpected argument: {}", arg);
+                return None;
+            }
         }
     }
+
+    Some(Args {
+        input_file: input_file?,
+        output_dir: output_dir?,
+        format,
+        remove_digits,
+        allow_empty_folders,
+    })
 }
 
 // ---------------------------------------------------------------------------
-//  Helpers
+//  Sanitization (no regex — pure string ops, faster)
 // ---------------------------------------------------------------------------
+const BAD_CHARS: &[char] = &['<', '>', ':', '"', '/', '\\', '|', '?', '*', '!', '%', '@', '#', '$', '~', '`', '^', '[', ']', '{', '}'];
+
 fn uid(s: &str) -> String {
     let mut hasher = DefaultHasher::new();
     s.hash(&mut hasher);
@@ -71,17 +85,11 @@ fn uid(s: &str) -> String {
 }
 
 fn smart_truncate(base: &str, max_length: usize) -> String {
-    if base.len() <= max_length {
-        return base.to_string();
-    }
-    if max_length <= 3 {
-        return base.chars().take(max_length).collect();
-    }
+    if base.len() <= max_length { return base.to_string(); }
+    if max_length <= 3 { return base.chars().take(max_length).collect(); }
     let cut = &base[..max_length - 3];
     if let Some(last_space) = cut.rfind(' ') {
-        if last_space > max_length / 2 {
-            return format!("{}...", &base[..last_space]);
-        }
+        if last_space > max_length / 2 { return format!("{}...", &base[..last_space]); }
     }
     format!("{}...", cut)
 }
@@ -89,80 +97,65 @@ fn smart_truncate(base: &str, max_length: usize) -> String {
 fn clean_suffix(base: &str) -> String {
     if base.len() > 5 {
         let prefix = &base[..base.len() - 5];
-        let suffix = &base[base.len() - 5..];
-        let cleaned_suffix = suffix.replace([' ', '.', '_'], "");
-        format!("{}{}", prefix, cleaned_suffix)
+        let suffix = base[base.len() - 5..].replace([' ', '.', '_'], "");
+        format!("{}{}", prefix, suffix)
     } else {
         base.replace([' ', '.'], "")
     }
 }
 
-fn sanitize_name(cleaners: &Cleaners, name: &str, no_digits: bool) -> String {
-    let mut s = cleaners.bad_chars.replace_all(name, "").into_owned();
+fn sanitize_name(name: &str, no_digits: bool) -> String {
+    let mut s: String = name.chars().filter(|c| !BAD_CHARS.contains(c)).collect();
 
     if no_digits {
-        s = cleaners.lead_digits.replace(&s, "").into_owned();
-        s = cleaners.dots.replace_all(&s, "").into_owned();
+        s = s.trim_start_matches(|c: char| c.is_ascii_digit() || c.is_whitespace()).to_string();
+        s = s.replace('.', "");
     } else {
-        s = cleaners.lead_list.replace(&s, "").into_owned();
-        s = cleaners.dots.replace_all(&s, "_").into_owned();
+        s = s.trim_start_matches(|c: char| c == '.' || c == '-').to_string();
+        s = s.replace('.', "_");
     }
 
-    s = cleaners.whitespace.replace_all(&s, " ").trim().to_string();
+    // Normalize whitespace
+    let mut result = String::with_capacity(s.len());
+    let mut prev_space = false;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            if !prev_space { result.push(' '); prev_space = true; }
+        } else {
+            result.push(c);
+            prev_space = false;
+        }
+    }
+    s = result.trim().to_string();
 
-    let max_len = 20usize;
     let (base, ext) = split_extension(&s);
-    let mut base = smart_truncate(base, max_len);
+    let mut base = smart_truncate(base, 20);
     base = base.trim_end_matches([' ', '.']).to_string();
     base = clean_suffix(&base);
     base = base.replace('.', "");
-
     format!("{}{}", base, ext)
 }
 
-/// Like std::path::Path::extension but preserves the dot and handles edge cases.
 fn split_extension(name: &str) -> (&str, &str) {
     if let Some(pos) = name.rfind('.') {
-        // don’t treat hidden files like ".gitignore" as having an extension
-        if pos > 0 {
-            return (&name[..pos], &name[pos..]);
-        }
+        if pos > 0 { return (&name[..pos], &name[pos..]); }
     }
     (name, "")
 }
 
 fn write_file(path: &Path, lines: &[String], title: &str) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
     let mut f = File::create(path)?;
     let escaped = title.replace('"', "\\\"");
     writeln!(f, "---")?;
     writeln!(f, r#"title: "{}""#, escaped)?;
     writeln!(f, "---\n")?;
-    for line in lines {
-        writeln!(f, "{}", line.replace("**", ""))?;
-    }
+    for line in lines { writeln!(f, "{}", line.replace("**", ""))?; }
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-//  JSON data model
-// ---------------------------------------------------------------------------
-#[derive(Debug, Deserialize)]
-struct JsonItem {
-    name: String,
-    #[serde(default)]
-    #[serde(rename = "type")]
-    item_type: String,
-    #[serde(default)]
-    body: String,
-    #[serde(default)]
-    children: Vec<JsonItem>,
-}
-
-// ---------------------------------------------------------------------------
-//  Internal tree node (arena-based: children store indices into the arena)
+//  Arena-based tree
 // ---------------------------------------------------------------------------
 struct Node {
     content: String,
@@ -176,9 +169,9 @@ struct Node {
 type Arena = Vec<Node>;
 
 // ---------------------------------------------------------------------------
-//  Parsers
+//  JSON parser (manual, no serde derive)
 // ---------------------------------------------------------------------------
-fn parse_json(data: Vec<JsonItem>, cleaners: &Cleaners, no_digits: bool) -> Arena {
+fn parse_json(data: &Value, no_digits: bool) -> Arena {
     let mut arena: Arena = Vec::new();
     arena.push(Node {
         content: String::new(),
@@ -189,38 +182,43 @@ fn parse_json(data: Vec<JsonItem>, cleaners: &Cleaners, no_digits: bool) -> Aren
         indent_level: 0,
     });
 
-    fn walk(
-        item: &JsonItem,
-        parent_idx: usize,
-        arena: &mut Arena,
-        cleaners: &Cleaners,
-        no_digits: bool,
-    ) {
+    fn walk(item: &Value, parent_idx: usize, arena: &mut Arena, no_digits: bool) {
+        let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("Unnamed");
         let idx = arena.len();
         arena.push(Node {
-            content: sanitize_name(cleaners, &item.name, no_digits),
-            full_line: item.name.clone(),
+            content: sanitize_name(name, no_digits),
+            full_line: name.to_string(),
             children: Vec::new(),
-            body_lines: item.body.lines().map(String::from).collect(),
-            unique_id: uid(&item.name),
+            body_lines: item.get("body").and_then(|v| v.as_str()).unwrap_or("").lines().map(String::from).collect(),
+            unique_id: uid(name),
             indent_level: 0,
         });
         arena[parent_idx].children.push(idx);
 
-        if item.item_type == "directory" {
-            for child in &item.children {
-                walk(child, idx, arena, cleaners, no_digits);
+        let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("file");
+        if item_type == "directory" {
+            if let Some(children) = item.get("children").and_then(|v| v.as_array()) {
+                for child in children { walk(child, idx, arena, no_digits); }
             }
         }
     }
 
-    for item in &data {
-        walk(item, 0, &mut arena, cleaners, no_digits);
-    }
+    let items = if let Some(arr) = data.as_array() {
+        arr.as_slice()
+    } else if let Some(obj) = data.as_object() {
+        obj.get("children").and_then(|v| v.as_array()).map(|v| v.as_slice()).unwrap_or(&[])
+    } else {
+        &[]
+    };
+
+    for item in items { walk(item, 0, &mut arena, no_digits); }
     arena
 }
 
-fn parse_text(lines: &[String], cleaners: &Cleaners) -> Arena {
+// ---------------------------------------------------------------------------
+//  Text parser
+// ---------------------------------------------------------------------------
+fn parse_text(lines: &[String]) -> Arena {
     let mut arena: Arena = Vec::new();
     arena.push(Node {
         content: String::new(),
@@ -236,17 +234,13 @@ fn parse_text(lines: &[String], cleaners: &Cleaners) -> Arena {
         let line_num = i + 1;
         let trimmed = raw.trim_start();
 
-        if line_num <= 3 && trimmed.starts_with("title:") {
-            continue;
-        }
+        if line_num <= 3 && trimmed.starts_with("title:") { continue; }
 
         let indent = raw.len() - trimmed.len();
-        let clean = sanitize_name(cleaners, trimmed, false);
+        let clean = sanitize_name(trimmed, false);
         let content = clean.trim();
 
-        if content.is_empty() {
-            continue;
-        }
+        if content.is_empty() { continue; }
 
         if raw.contains("**") {
             let parent_idx = *stack.last().unwrap();
@@ -283,7 +277,6 @@ fn build_tree(
     arena: &Arena,
     node_idx: usize,
     parent_path: &Path,
-    cleaners: &Cleaners,
     no_digits: bool,
     allow_empty: bool,
 ) -> io::Result<()> {
@@ -295,9 +288,9 @@ fn build_tree(
         let safe = if full.starts_with('"') && full.ends_with('"') {
             let inner = &full[1..full.len() - 1];
             let (base, ext) = split_extension(inner);
-            format!("{}{}", sanitize_name(cleaners, base, no_digits), ext)
+            format!("{}{}", sanitize_name(base, no_digits), ext)
         } else {
-            sanitize_name(cleaners, &child.content, no_digits)
+            sanitize_name(&child.content, no_digits)
         };
 
         let (base, ext) = split_extension(&safe);
@@ -312,8 +305,7 @@ fn build_tree(
                 dir = parent_path.join(&uniq);
             }
             fs::create_dir_all(&dir)?;
-            let md = dir.join("index.md");
-            (dir, md)
+            (dir.clone(), dir.join("index.md"))
         } else {
             let mut md = parent_path.join(format!("{}{}", base, ext));
             if md.exists() {
@@ -324,7 +316,7 @@ fn build_tree(
         };
 
         write_file(&md_path, &child.body_lines, full)?;
-        build_tree(arena, child_idx, &target_dir, cleaners, no_digits, allow_empty)?;
+        build_tree(arena, child_idx, &target_dir, no_digits, allow_empty)?;
     }
     Ok(())
 }
@@ -333,26 +325,29 @@ fn build_tree(
 //  Main
 // ---------------------------------------------------------------------------
 fn main() {
-    let cli = Cli::parse();
-    let cleaners = Cleaners::new();
+    let args = parse_args().unwrap_or_else(|| {
+        eprintln!("Usage: detree3 <input_file> <output_dir> [OPTIONS]");
+        eprintln!("Run with --help for more info.");
+        std::process::exit(1);
+    });
 
     // Validation
-    if !cli.input_file.exists() {
-        eprintln!("Error: '{}' not found.", cli.input_file.display());
+    if !args.input_file.exists() {
+        eprintln!("Error: '{}' not found.", args.input_file.display());
         std::process::exit(1);
     }
-    if !cli.input_file.is_file() {
-        eprintln!("Error: '{}' is not a file.", cli.input_file.display());
+    if !args.input_file.is_file() {
+        eprintln!("Error: '{}' is not a file.", args.input_file.display());
         std::process::exit(1);
     }
-    let meta = fs::metadata(&cli.input_file).unwrap();
+    let meta = fs::metadata(&args.input_file).unwrap();
     if meta.len() == 0 {
-        eprintln!("Error: '{}' is empty.", cli.input_file.display());
+        eprintln!("Error: '{}' is empty.", args.input_file.display());
         std::process::exit(1);
     }
 
     // Read
-    let file = File::open(&cli.input_file).unwrap_or_else(|e| {
+    let file = File::open(&args.input_file).unwrap_or_else(|e| {
         eprintln!("Error reading file: {}", e);
         std::process::exit(1);
     });
@@ -361,11 +356,12 @@ fn main() {
     let content = lines.join("\n");
 
     // Detect format
-    let fmt = match cli.format {
+    let fmt = match args.format {
         Format::Auto => {
             let first_non_empty = lines.iter().find(|l| !l.trim().is_empty());
             if let Some(line) = first_non_empty {
-                if line.trim_start().starts_with('{') || line.trim_start().starts_with('[') {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with('{') || trimmed.starts_with('[') {
                     Format::Json
                 } else {
                     Format::Text
@@ -380,44 +376,22 @@ fn main() {
     // Parse
     let arena = match fmt {
         Format::Json => {
-            let json_data: Vec<JsonItem> = if content.trim_start().starts_with('[') {
-                serde_json::from_str(&content).unwrap_or_else(|e| {
-                    eprintln!("Error: invalid JSON — {}", e);
-                    std::process::exit(1);
-                })
-            } else {
-                let obj: serde_json::Value = serde_json::from_str(&content).unwrap_or_else(|e| {
-                    eprintln!("Error: invalid JSON — {}", e);
-                    std::process::exit(1);
-                });
-                let children = obj.get("children").and_then(|v| v.as_array());
-                children
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| serde_json::from_value(v.clone()).ok())
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            };
-            parse_json(json_data, &cleaners, cli.remove_digits)
+            let json_data: Value = serde_json::from_str(&content).unwrap_or_else(|e| {
+                eprintln!("Error: invalid JSON — {}", e);
+                std::process::exit(1);
+            });
+            parse_json(&json_data, args.remove_digits)
         }
-        Format::Text => parse_text(&lines, &cleaners),
+        Format::Text => parse_text(&lines),
         Format::Auto => unreachable!(),
     };
 
-    fs::create_dir_all(&cli.output_dir).unwrap();
-    build_tree(
-        &arena,
-        0,
-        &cli.output_dir,
-        &cleaners,
-        cli.remove_digits,
-        cli.allow_empty_folders,
-    )
-    .unwrap_or_else(|e| {
-        eprintln!("Error during build: {}", e);
-        std::process::exit(1);
-    });
+    fs::create_dir_all(&args.output_dir).unwrap();
+    build_tree(&arena, 0, &args.output_dir, args.remove_digits, args.allow_empty_folders)
+        .unwrap_or_else(|e| {
+            eprintln!("Error during build: {}", e);
+            std::process::exit(1);
+        });
 
     println!("Done.");
 }
