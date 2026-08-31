@@ -86,7 +86,7 @@ jobs:
             "dist/detree-${{ matrix.target }}${{ matrix.suffix }}"
 
       - name: Upload binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: detree-${{ matrix.target }}
           path: dist/*
@@ -101,7 +101,7 @@ jobs:
       contents: write
     steps:
       - name: Download binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           path: artifacts
           pattern: detree-*
