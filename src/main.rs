@@ -108,10 +108,7 @@ fn sanitize_extension(ext: &str) -> String {
     let Some(body) = ext.strip_prefix('.') else {
         return String::new();
     };
-    if body.is_empty()
-        || body.len() > 16
-        || !body.chars().all(|ch| ch.is_ascii_alphanumeric())
-    {
+    if body.is_empty() || body.len() > 16 || !body.chars().all(|ch| ch.is_ascii_alphanumeric()) {
         return String::new();
     }
     format!(".{body}")
@@ -363,7 +360,14 @@ fn build_tree(
         };
 
         write_file(&md_path, &child.body_lines, full)?;
-        build_tree(arena, child_idx, &target_dir, cleaners, no_digits, allow_empty)?;
+        build_tree(
+            arena,
+            child_idx,
+            &target_dir,
+            cleaners,
+            no_digits,
+            allow_empty,
+        )?;
     }
     Ok(())
 }
@@ -408,8 +412,7 @@ fn run(cli: Cli) -> Result<(), String> {
     let arena = match fmt {
         Format::Json => {
             let json_data: Vec<JsonItem> = if content.trim_start().starts_with('[') {
-                serde_json::from_str(&content)
-                    .map_err(|error| format!("invalid JSON: {error}"))?
+                serde_json::from_str(&content).map_err(|error| format!("invalid JSON: {error}"))?
             } else {
                 let obj: serde_json::Value = serde_json::from_str(&content)
                     .map_err(|error| format!("invalid JSON: {error}"))?;
@@ -472,10 +475,8 @@ mod tests {
                 .expect("clock must be after the Unix epoch")
                 .as_nanos();
             let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "detree-test-{}-{stamp}-{id}",
-                std::process::id()
-            ));
+            let path = std::env::temp_dir()
+                .join(format!("detree-test-{}-{stamp}-{id}", std::process::id()));
             fs::create_dir_all(&path).expect("test directory should be created");
             Self(path)
         }
@@ -490,7 +491,10 @@ mod tests {
     #[test]
     fn sanitizes_names_portably() {
         let cleaners = Cleaners::new();
-        assert_eq!(sanitize_name(&cleaners, "File@With#Chars", false), "FileWithChars");
+        assert_eq!(
+            sanitize_name(&cleaners, "File@With#Chars", false),
+            "FileWithChars"
+        );
         assert_eq!(sanitize_name(&cleaners, "123 Report", true), "Report");
         assert_eq!(sanitize_name(&cleaners, "CON", false), "CON_");
         assert_eq!(sanitize_name(&cleaners, "***", false), "untitled");
