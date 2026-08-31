@@ -1,10 +1,17 @@
 [package]
-name = "detree3"
-version = "1.0.0"
+name = "detree"
+version = "1.1.0"
 edition = "2021"
-authors = ["Morgan Ross <morgan@example.com>"]
+rust-version = "1.81"
+authors = ["Morgan Ross <morganross@rossmorr.com>"]
 description = "Convert tree lists or JSON into directories & Markdown files"
 license = "MIT"
+repository = "https://github.com/morganross/detree3"
+homepage = "https://github.com/morganross/detree3"
+readme = "README.md"
+keywords = ["cli", "markdown", "docusaurus", "filesystem", "generator"]
+categories = ["command-line-utilities", "filesystem"]
+exclude = ["/target", "/dist"]
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }

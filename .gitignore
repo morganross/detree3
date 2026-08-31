@@ -1,0 +1,6 @@
+/target/
+/dist/
+*.pdb
+.DS_Store
+Thumbs.db
+

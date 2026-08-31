@@ -1,17 +1,15 @@
 use clap::Parser;
 use regex::Regex;
 use serde::Deserialize;
-use std::collections::hash_map::DefaultHasher;
 use std::fs::{self, File};
-use std::hash::{Hash, Hasher};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
 //  CLI
 // ---------------------------------------------------------------------------
 #[derive(Parser, Debug)]
-#[command(name = "detree3", version, about)]
+#[command(name = "detree", version, about)]
 struct Cli {
     #[arg(help = "Input file (text list or JSON)")]
     input_file: PathBuf,
@@ -65,36 +63,67 @@ impl Cleaners {
 //  Helpers
 // ---------------------------------------------------------------------------
 fn uid(s: &str) -> String {
-    let mut hasher = DefaultHasher::new();
-    s.hash(&mut hasher);
-    format!("{:06x}", hasher.finish() & 0xFFFF_FFFF)
+    // Stable FNV-1a keeps duplicate suffixes deterministic across Rust releases.
+    let mut hash = 0x811c_9dc5_u32;
+    for byte in s.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    format!("{hash:08x}")
 }
 
 fn smart_truncate(base: &str, max_length: usize) -> String {
-    if base.len() <= max_length {
+    let chars: Vec<char> = base.chars().collect();
+    if chars.len() <= max_length {
         return base.to_string();
     }
     if max_length <= 3 {
-        return base.chars().take(max_length).collect();
+        return chars.into_iter().take(max_length).collect();
     }
-    let cut = &base[..max_length - 3];
+    let cut: String = chars[..max_length - 3].iter().collect();
     if let Some(last_space) = cut.rfind(' ') {
         if last_space > max_length / 2 {
-            return format!("{}...", &base[..last_space]);
+            return format!("{}...", &cut[..last_space]);
         }
     }
     format!("{}...", cut)
 }
 
 fn clean_suffix(base: &str) -> String {
-    if base.len() > 5 {
-        let prefix = &base[..base.len() - 5];
-        let suffix = &base[base.len() - 5..];
-        let cleaned_suffix = suffix.replace([' ', '.', '_'], "");
-        format!("{}{}", prefix, cleaned_suffix)
+    let chars: Vec<char> = base.chars().collect();
+    if chars.len() > 5 {
+        let split = chars.len() - 5;
+        let prefix: String = chars[..split].iter().collect();
+        let suffix: String = chars[split..]
+            .iter()
+            .filter(|ch| !matches!(ch, ' ' | '.' | '_'))
+            .collect();
+        format!("{prefix}{suffix}")
     } else {
         base.replace([' ', '.'], "")
     }
+}
+
+fn sanitize_extension(ext: &str) -> String {
+    let Some(body) = ext.strip_prefix('.') else {
+        return String::new();
+    };
+    if body.is_empty()
+        || body.len() > 16
+        || !body.chars().all(|ch| ch.is_ascii_alphanumeric())
+    {
+        return String::new();
+    }
+    format!(".{body}")
+}
+
+fn is_windows_reserved(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (upper.len() == 4
+            && (upper.starts_with("COM") || upper.starts_with("LPT"))
+            && upper.as_bytes()[3].is_ascii_digit()
+            && upper.as_bytes()[3] != b'0')
 }
 
 fn sanitize_name(cleaners: &Cleaners, name: &str, no_digits: bool) -> String {
@@ -116,8 +145,14 @@ fn sanitize_name(cleaners: &Cleaners, name: &str, no_digits: bool) -> String {
     base = base.trim_end_matches([' ', '.']).to_string();
     base = clean_suffix(&base);
     base = base.replace('.', "");
+    if base.is_empty() {
+        base = "untitled".to_string();
+    }
+    if is_windows_reserved(&base) {
+        base.push('_');
+    }
 
-    format!("{}{}", base, ext)
+    format!("{}{}", base, sanitize_extension(ext))
 }
 
 /// Like std::path::Path::extension but preserves the dot and handles edge cases.
@@ -295,7 +330,11 @@ fn build_tree(
         let safe = if full.starts_with('"') && full.ends_with('"') {
             let inner = &full[1..full.len() - 1];
             let (base, ext) = split_extension(inner);
-            format!("{}{}", sanitize_name(cleaners, base, no_digits), ext)
+            format!(
+                "{}{}",
+                sanitize_name(cleaners, base, no_digits),
+                sanitize_extension(ext)
+            )
         } else {
             sanitize_name(cleaners, &child.content, no_digits)
         };
@@ -332,33 +371,21 @@ fn build_tree(
 // ---------------------------------------------------------------------------
 //  Main
 // ---------------------------------------------------------------------------
-fn main() {
-    let cli = Cli::parse();
+fn run(cli: Cli) -> Result<(), String> {
     let cleaners = Cleaners::new();
 
-    // Validation
     if !cli.input_file.exists() {
-        eprintln!("Error: '{}' not found.", cli.input_file.display());
-        std::process::exit(1);
+        return Err(format!("'{}' not found", cli.input_file.display()));
     }
     if !cli.input_file.is_file() {
-        eprintln!("Error: '{}' is not a file.", cli.input_file.display());
-        std::process::exit(1);
+        return Err(format!("'{}' is not a file", cli.input_file.display()));
     }
-    let meta = fs::metadata(&cli.input_file).unwrap();
-    if meta.len() == 0 {
-        eprintln!("Error: '{}' is empty.", cli.input_file.display());
-        std::process::exit(1);
+    let content = fs::read_to_string(&cli.input_file)
+        .map_err(|error| format!("could not read '{}': {error}", cli.input_file.display()))?;
+    if content.is_empty() {
+        return Err(format!("'{}' is empty", cli.input_file.display()));
     }
-
-    // Read
-    let file = File::open(&cli.input_file).unwrap_or_else(|e| {
-        eprintln!("Error reading file: {}", e);
-        std::process::exit(1);
-    });
-    let reader = BufReader::new(file);
-    let lines: Vec<String> = reader.lines().map(|l| l.unwrap()).collect();
-    let content = lines.join("\n");
+    let lines: Vec<String> = content.lines().map(str::to_owned).collect();
 
     // Detect format
     let fmt = match cli.format {
@@ -381,15 +408,11 @@ fn main() {
     let arena = match fmt {
         Format::Json => {
             let json_data: Vec<JsonItem> = if content.trim_start().starts_with('[') {
-                serde_json::from_str(&content).unwrap_or_else(|e| {
-                    eprintln!("Error: invalid JSON — {}", e);
-                    std::process::exit(1);
-                })
+                serde_json::from_str(&content)
+                    .map_err(|error| format!("invalid JSON: {error}"))?
             } else {
-                let obj: serde_json::Value = serde_json::from_str(&content).unwrap_or_else(|e| {
-                    eprintln!("Error: invalid JSON — {}", e);
-                    std::process::exit(1);
-                });
+                let obj: serde_json::Value = serde_json::from_str(&content)
+                    .map_err(|error| format!("invalid JSON: {error}"))?;
                 let children = obj.get("children").and_then(|v| v.as_array());
                 children
                     .map(|arr| {
@@ -405,7 +428,12 @@ fn main() {
         Format::Auto => unreachable!(),
     };
 
-    fs::create_dir_all(&cli.output_dir).unwrap();
+    fs::create_dir_all(&cli.output_dir).map_err(|error| {
+        format!(
+            "could not create output directory '{}': {error}",
+            cli.output_dir.display()
+        )
+    })?;
     build_tree(
         &arena,
         0,
@@ -414,10 +442,111 @@ fn main() {
         cli.remove_digits,
         cli.allow_empty_folders,
     )
-    .unwrap_or_else(|e| {
-        eprintln!("Error during build: {}", e);
-        std::process::exit(1);
-    });
+    .map_err(|error| format!("could not build output: {error}"))?;
 
     println!("Done.");
+    Ok(())
+}
+
+fn main() {
+    if let Err(error) = run(Cli::parse()) {
+        eprintln!("Error: {error}");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock must be after the Unix epoch")
+                .as_nanos();
+            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "detree-test-{}-{stamp}-{id}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).expect("test directory should be created");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn sanitizes_names_portably() {
+        let cleaners = Cleaners::new();
+        assert_eq!(sanitize_name(&cleaners, "File@With#Chars", false), "FileWithChars");
+        assert_eq!(sanitize_name(&cleaners, "123 Report", true), "Report");
+        assert_eq!(sanitize_name(&cleaners, "CON", false), "CON_");
+        assert_eq!(sanitize_name(&cleaners, "***", false), "untitled");
+    }
+
+    #[test]
+    fn truncation_is_unicode_safe() {
+        let value = "Documentation 🦀 with Unicode characters";
+        let truncated = smart_truncate(value, 20);
+        assert!(truncated.chars().count() <= 20);
+        assert!(truncated.ends_with("..."));
+    }
+
+    #[test]
+    fn rejects_unsafe_extensions() {
+        assert_eq!(sanitize_extension(".md"), ".md");
+        assert_eq!(sanitize_extension(".txt/child"), "");
+        assert_eq!(sanitize_extension("../../escape"), "");
+    }
+
+    #[test]
+    fn parses_nested_text_and_body_content() {
+        let cleaners = Cleaners::new();
+        let lines = vec![
+            "Root".to_string(),
+            "  Child".to_string(),
+            "  **Body text**".to_string(),
+        ];
+        let arena = parse_text(&lines, &cleaners);
+        assert_eq!(arena[0].children.len(), 1);
+        let root = arena[0].children[0];
+        assert_eq!(arena[root].children.len(), 1);
+        let child = arena[root].children[0];
+        assert_eq!(arena[child].body_lines, vec!["  **Body text**"]);
+    }
+
+    #[test]
+    fn builds_expected_markdown_tree() {
+        let cleaners = Cleaners::new();
+        let lines = vec![
+            "Documentation".to_string(),
+            "  Quick Start".to_string(),
+            "  **Install and run.**".to_string(),
+        ];
+        let arena = parse_text(&lines, &cleaners);
+        let output = TestDir::new();
+        build_tree(&arena, 0, &output.0, &cleaners, false, false)
+            .expect("tree should be generated");
+
+        let index = output.0.join("Documentation").join("index.md");
+        let child = output.0.join("Documentation").join("Quick Start.md");
+        assert!(index.is_file());
+        assert!(child.is_file());
+        let body = fs::read_to_string(child).expect("child output should be readable");
+        assert!(body.contains("title: \"Quick Start\""));
+        assert!(body.contains("Install and run."));
+        assert!(!body.contains("**"));
+    }
 }
