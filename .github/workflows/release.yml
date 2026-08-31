@@ -16,7 +16,7 @@ jobs:
     name: Check and test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -31,6 +31,9 @@ jobs:
 
       - name: Run tests
         run: cargo test --locked --all-targets
+
+      - name: Verify publishable crate
+        run: cargo package --locked
 
   build:
     name: Build ${{ matrix.target }}
@@ -57,7 +60,7 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
